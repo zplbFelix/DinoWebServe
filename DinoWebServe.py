@@ -688,7 +688,7 @@ def before_request():
 @app.route('/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE', 'HEAD', 'OPTIONS'])
 def serve(path):
     """Main request handler"""
-    if path.startswith(".."):
+    if "../" in path:
         return "404", 404
     if isinstance(Config.WWW_ROOT, dict):
         if str(request.host) in Config.WWW_ROOT:
@@ -833,5 +833,6 @@ for code in [400, 401, 403, 404, 405, 406, 408, 409, 410,
 if __name__ == "__main__":
     print(f"Starting server on port {Config.PORT}")
     app.run(host='0.0.0.0', port=Config.PORT)
+
 
 

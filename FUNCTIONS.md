@@ -90,6 +90,26 @@ echo(f"<p>Is JSON: {is_json()}</p>")
 </python>
 ```
 
+## Response Control
+- `set_header(key, value)`
+  - Purpose: Set a response header
+  - Example:
+    ```html
+    <python>
+    set_header("X-Powered-By", "DinoWebServe")
+    </python>
+    ```
+
+- `set_content_type(mimetype)`
+  - Purpose: Set the response MIME type (Content-Type)
+  - Example:
+    ```html
+    <python>
+    set_content_type("application/xml; charset=utf-8")
+    echo("<?xml version='1.0' ?><rss>...</rss>")
+    </python>
+    ```
+
 ## Authentication & Range Requests
 - `auth_basic()` – returns `(username, password)` or `(None, None)`
 - `auth_bearer()` – extracts token from `Authorization: Bearer xxx`, returns `None` if missing

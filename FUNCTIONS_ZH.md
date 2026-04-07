@@ -85,6 +85,46 @@ echo(f"<p>是否 JSON：{is_json()}</p>")
 </python>
 ```
 
+## 响应控制
+- `set_header(key, value)`
+  - 作用：设置响应头（Response Header）
+  - 示例：
+    ```html
+    <python>
+    set_header("X-Powered-By", "DinoWebServe")
+    </python>
+    ```
+
+- `set_content_type(mimetype)`
+  - 作用：设置响应的 MIME 类型（Content-Type）
+  - 示例：
+    ```html
+    <python>
+    set_content_type("application/xml; charset=utf-8")
+    echo("<?xml version='1.0' ?><rss>...</rss>")
+    </python>
+    ```
+
+## 响应控制
+- `set_header(key, value)`
+  - 作用：设置响应头（Response Header）
+  - 示例：
+    ```html
+    <python>
+    set_header("X-Powered-By", "DinoWebServe")
+    </python>
+    ```
+
+- `set_content_type(mimetype)`
+  - 作用：设置响应的 MIME 类型（Content-Type）
+  - 示例：
+    ```html
+    <python>
+    set_content_type("application/xml; charset=utf-8")
+    echo("<?xml version='1.0' ?><rss>...</rss>")
+    </python>
+    ```
+
 ## 认证与范围请求
 - `auth_basic()`：返回 `(username, password)` 或 `(None, None)`
 - `auth_bearer()`：从 `Authorization: Bearer xxx` 提取 token，失败返回 `None`

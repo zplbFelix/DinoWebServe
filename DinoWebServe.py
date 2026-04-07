@@ -139,6 +139,7 @@ try:
 except Exception as e:
     print(colorama.Fore.RED + f'Error loading config: {str(e)}\nUsing default configuration')
 
+function_config = ""
 try:
     config_path = os.path.join(Config.CONFIG_DIR, 'function.py')
     if os.path.exists(config_path):
@@ -151,7 +152,8 @@ except Exception as e:
     print(colorama.Fore.RED + f'Error loading Function: {str(e)}')
 
 # Initialize Flask app
-app = Flask(__name__)
+app = Flask(__name__, static_folder=None)
+_http_session = requests.Session()
 
 # Suppress Flask logging if possible
 try:
@@ -334,53 +336,50 @@ def run_python(text, exec_scope=None):
     try:
         content = ''
         if exec_scope is None:
-            exec_scope = {'__builtins__': __builtins__}
-        elif '__builtins__' not in exec_scope:
-            exec_scope['__builtins__'] = __builtins__
+            exec_scope = {
+                '__builtins__': __builtins__,
+                'request': request,
+                'app': app,
+                'Config': Config
+            }
+            if function_config:
+                try:
+                    exec(function_config, exec_scope)
+                except Exception as e:
+                    print(colorama.Fore.RED + f'Function execution failed: {str(e)}')
 
         def new_print(*args, sep=' ', end='\n', file=None, flush=False, output=False):
             nonlocal content
             output_file = file if file is not None else sys.stdout
-            text = sep.join(str(arg) for arg in args)
+            text_str = sep.join(str(arg) for arg in args)
             if output:
-                output_file.write(text + end)
+                output_file.write(text_str + end)
                 if flush:
                     output_file.flush()
-            content += text
-        def new_echo(text):
+            content += text_str
+
+        def new_echo(text_val):
             nonlocal content
-            content += str(text)
+            content += str(text_val)
 
         def ERROR(*args, **kwargs):
             raise NameError('This function has been disabled')
 
-        func_dict = {}
-        try:
-            exec(function_config)
-            tree = ast.parse(function_config)
-            func_names = [node.name for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)]
-            func_dict = ""
-            for func in func_names:
-                func_dict += f'"{func}": {func}, '
-            func_dict = f"{{{func_dict[:-2]}}}"
-            func_dict = eval(func_dict)
-        except:
-            print(colorama.Fore.RED + 'Function execution failed')
-        new = {'print': new_print, 'echo': new_echo}
-        for func in func_dict:
-            new[func] = func_dict[func]
+        exec_scope['print'] = new_print
+        exec_scope['echo'] = new_echo
 
-        for i in new:
-            if i in Config.DISABLE_PYTHON_FUNCTIONS:
-                continue
-            exec_scope[i] = new[i]
         for func in Config.DISABLE_PYTHON_FUNCTIONS:
             exec_scope[func] = ERROR
+
         for i in Config.ENABLE_PYTHON_LIBRARIES:
-            try:
-                exec_scope[i] = __import__(i)
-            except:
-                continue
+            if i not in exec_scope:
+                try:
+                    exec_scope[i] = __import__(i)
+                except:
+                    continue
+
+        g = "".join([n for n in [i for i in text.split("\n") if i.strip()][0] if n in ("\t", " ")])
+        text = "\n".join([t[len(g):] if t.startswith(g) else t for t in text.split("\n")])
 
         exec(text, exec_scope)
     except Exception as e:
@@ -400,7 +399,12 @@ def extract_all_python_tags(html):
         elif s[0] == "python":
             result, shared_scope = run_python(s[1], shared_scope)
             text += result
-    return text
+    
+    response = make_response(text)
+    if hasattr(request, 'custom_headers'):
+        for k, v in request.custom_headers.items():
+            response.headers[k] = v
+    return response
 
 # ================
 # PHP Interpreter
@@ -678,6 +682,63 @@ def log_request():
 # Request Handlers
 # ================
 
+def forward_request(url, path, query_string):
+    url = f"{Config.WWW_ROOT[url]}/{path}"
+    if query_string:
+        url += f"?{query_string.decode()}"
+    real_ip = get_ip()
+    # -------- 请求头处理 --------
+    headers = dict(request.headers)
+    # 强制修复 Host
+    headers["Host"] = urlparse(url).netloc
+    # 防 gzip 差异（关键）
+    headers.pop("Accept-Encoding", None)
+    # 覆盖所有客户端可伪造 IP 头
+    headers["X-Real-IP"] = real_ip
+    headers["X-Forwarded-For"] = real_ip
+    headers["X-Forwarded-Proto"] = request.scheme
+    # -------- 请求转发 --------
+    resp = _http_session.request(
+        method=request.method,
+        url=url,
+        headers=headers,
+        data=request.stream,
+        cookies=request.cookies,
+        stream=True,
+        allow_redirects=False
+    )
+
+    # -------- 响应体（流式）--------
+    def generate():
+        for chunk in resp.iter_content(chunk_size=8192):
+            if chunk:
+                yield chunk
+
+    # -------- 响应头处理 --------
+    excluded_headers = {
+        'connection',
+        'keep-alive',
+        'proxy-authenticate',
+        'proxy-authorization',
+        'te',
+        'trailers',
+        'transfer-encoding',
+        'upgrade',
+        'content-length',
+        'content-encoding',
+        'server',
+        'x-powered-by'
+    }
+    response_headers = [
+        (k, v) for k, v in resp.headers.items()
+        if k.lower() not in excluded_headers
+    ]
+    return Response(
+        generate(),
+        status=resp.status_code,
+        headers=response_headers
+    )
+
 @app.before_request
 def before_request():
     """Log all requests"""
@@ -693,75 +754,99 @@ def serve(path):
     if isinstance(Config.WWW_ROOT, dict):
         if str(request.host) in Config.WWW_ROOT:
             if Config.WWW_ROOT[str(request.host)].startswith("http"):
-                url = f"{Config.WWW_ROOT[str(request.host)]}/{path}"
-                real_ip = get_ip()
-                # -------- 请求头处理 --------
-                headers = dict(request.headers)
-                # 强制修复 Host
-                headers["Host"] = urlparse(url).netloc
-                # 防 gzip 差异（关键）
-                headers.pop("Accept-Encoding", None)
-                # 覆盖所有客户端可伪造 IP 头
-                headers["X-Real-IP"] = real_ip
-                headers["X-Forwarded-For"] = real_ip
-                headers["X-Forwarded-Proto"] = request.scheme
-                # -------- 请求转发 --------
-                resp = requests.request(
-                    method=request.method,
-                    url=url,
-                    headers=headers,
-                    data=request.stream,
-                    cookies=request.cookies,
-                    stream=True,
-                    allow_redirects=False
-                )
-
-                # -------- 响应体（流式）--------
-                def generate():
-                    for chunk in resp.iter_content(chunk_size=8192):
-                        if chunk:
-                            yield chunk
-
-                # -------- 响应头处理 --------
-                excluded_headers = {
-                    "content-encoding",
-                    "content-length",
-                    "transfer-encoding",
-                    "connection",
-                }
-                response_headers = [
-                    (k, v) for k, v in resp.headers.items()
-                    if k.lower() not in excluded_headers
-                ]
-                return Response(
-                    generate(),
-                    status=resp.status_code,
-                    headers=response_headers
-                )
+                return forward_request(str(request.host), path, request.query_string)
             else:
                 WWW_ROOT = Config.WWW_ROOT[str(request.host)]
         elif "ELSE" in Config.WWW_ROOT:
-            WWW_ROOT = Config.WWW_ROOT["ELSE"]
+            if Config.WWW_ROOT["ELSE"].startswith("http"):
+                return forward_request(str(request.host), path, request.query_string)
+            else:
+                WWW_ROOT = Config.WWW_ROOT["ELSE"]
         else:
             return "<!DOCTYPE html> <html> <head> <title>404 Not Found</title> <style> body { background-color: #fff; color: #000; font-family: Arial, sans-serif; text-align: center; margin-top: 10%; } h1 { font-size: 2em; margin-bottom: 0.5em; } p { color: #555; } </style> </head> <body> <h1>404 Not Found</h1> <p>DinoWebServe</p> </body> </html>", 404
     else:
         WWW_ROOT = Config.WWW_ROOT
+
     WWW_ROOT = WWW_ROOT.replace('/','\\')
     fs_path = os.path.join(WWW_ROOT, path)
+
+    # Try dynamic extension mapping (e.g., access rss.xml -> rss.xml.pys)
+    if not os.path.exists(fs_path):
+        for dynamic_ext in ['pys', 'php', 'pp']:
+            if os.path.isfile(fs_path + '.' + dynamic_ext):
+                fs_path = fs_path + '.' + dynamic_ext
+                break
+
+    # Try wildcard mapping (e.g., access post/abc -> post.{}.pys)
+    if not os.path.exists(fs_path):
+        try:
+            # We look for a file that matches the prefix and has {} 
+            parts = path.replace('\\', '/').split('/')
+            for i in range(len(parts) + 1):
+                dir_rel = "/".join(parts[:i])
+                full_dir = os.path.join(WWW_ROOT, dir_rel)
+                if not os.path.isdir(full_dir):
+                    break
+                
+                match_name = "/".join(parts[i:])
+                if not match_name:
+                    continue
+                
+                for item in os.listdir(full_dir):
+                    if '{}.' in item:
+                        prefix, rest = item.split('{}.', 1)
+                        # Remove trailing dot for flexible prefix matching
+                        clean_prefix = prefix.rstrip('.')
+                        ext = get_file_extension(item).lower()
+                        if ext in Config.HTML_EXTENSIONS and match_name.startswith(clean_prefix):
+                            fs_path = os.path.join(full_dir, item)
+                            break
+                if os.path.isfile(fs_path):
+                    break
+        except:
+            pass
+
     if os.path.isdir(fs_path):
         # Check for index files
-        for index_file in Config.HTML_EXTENSIONS:
-            index_path = os.path.join(fs_path, 'index.'+index_file)
-            if os.path.exists(index_path):
-                if index_file == 'pys':
-                    with open(index_path, 'r', encoding=Config.ENCODING) as f:
-                        html_content = f.read()
-                    return extract_all_python_tags(html_content)
-                if index_file == 'php':
-                    return run_php(index_path, WWW_ROOT)[1]
-                if index_file == 'pp':
-                    return run_pp(index_path, WWW_ROOT)
-                return serve_file(index_path, 'text/html', WWW_ROOT=WWW_ROOT)
+        found_index_path = None
+        found_index_ext = None
+
+        # 1. Try standard index files first (exact matches like index.pys)
+        for ext in Config.HTML_EXTENSIONS:
+            test_path = os.path.join(fs_path, 'index.' + ext)
+            if os.path.isfile(test_path):
+                found_index_path = test_path
+                found_index_ext = ext
+                break
+
+        # 2. Try extended index files (index.*.pys)
+        if not found_index_path:
+            try:
+                candidates = []
+                for item in os.listdir(fs_path):
+                    if item.startswith('index.') and os.path.isfile(os.path.join(fs_path, item)):
+                        ext = get_file_extension(item).lower()
+                        if ext in Config.HTML_EXTENSIONS:
+                            candidates.append((item, ext))
+                if candidates:
+                    # Sort candidates to ensure deterministic behavior (shortest first)
+                    candidates.sort(key=lambda x: (len(x[0]), x[0]))
+                    best_name, best_ext = candidates[0]
+                    found_index_path = os.path.join(fs_path, best_name)
+                    found_index_ext = best_ext
+            except Exception as e:
+                app.logger.error(f"Error listing directory for index files: {e}")
+
+        if found_index_path:
+            if found_index_ext == 'pys':
+                with open(found_index_path, 'r', encoding=Config.ENCODING) as f:
+                    html_content = f.read()
+                return extract_all_python_tags(html_content)
+            if found_index_ext == 'php':
+                return run_php(found_index_path, WWW_ROOT)[1]
+            if found_index_ext == 'pp':
+                return run_pp(found_index_path, WWW_ROOT)
+            return serve_file(found_index_path, 'text/html', WWW_ROOT=WWW_ROOT)
         # Generate directory listing if no index file found
         return generate_directory_listing(fs_path, '/' + path, WWW_ROOT)
 

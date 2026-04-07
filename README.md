@@ -19,6 +19,10 @@ A lightweight multi-functional web server based on Flask, supporting dynamic scr
 - **Custom Error Pages**: Support for custom HTTP error pages
 - **Request Logging**: Log all HTTP requests by date
 - **Automatic Log Cleanup**: Delete old logs based on retention days
+- **Intelligent Route Mapping**:
+  - **Virtual Extension Mapping**: Access `rss.xml` to automatically map to `rss.xml.pys`
+  - **Flexible Index Files**: Supports `index.ANY_SUFFIX.pys` as a directory default page
+  - **Wildcard Matching**: Supports `post.{}.pys` to match `post/abc` or `post-123.html` etc.
 
 ## 📋 System Requirements
 
@@ -156,6 +160,20 @@ echo("<p>Python says: Current timestamp is " + str(time.time()) + "</p>")
 </body>
 </html>
 ```
+
+### Intelligent Route Mapping Examples
+
+#### 1. Virtual Extension Mapping
+If you request `/rss.xml` and `rss.xml.pys` exists in the `WWW` directory, the server will automatically execute that script and return the result.
+
+#### 2. Wildcard Files
+Create a file named `post.{}.pys` to capture various dynamic paths:
+- Request `/post/123` -> matches `post.{}.pys`
+- Request `/post-news.html` -> matches `post.{}.pys`
+- Calling `path()` in the script returns the original request path (e.g., `/post/123`).
+
+#### 3. Flexible Index
+Supports `index.ANY_SUFFIX.pys` as a directory entry point. For example, `index.rss.pys` will be executed when accessing the directory root (if standard `index.pys` is missing).
 
 ### Available Python Functions
 

@@ -19,6 +19,10 @@
 - **自定义错误页面**：支持自定义 HTTP 错误页面
 - **请求日志**：按日期记录所有 HTTP 请求
 - **日志自动清理**：可按保留天数自动删除过期日志
+- **智能路由映射**：
+  - **虚拟后缀映射**：访问 `rss.xml` 可自动映射至 `rss.xml.pys`
+  - **灵活索引文件**：支持 `index.任何后缀.pys` 作为目录默认页
+  - **通配符匹配**：支持 `post.{}.pys` 匹配 `post/abc` 或 `post-123.html` 等动态路径
 
 ## 📋 系统需求
 
@@ -156,6 +160,20 @@ echo("<p>Python 说：当前时间戳是 " + str(time.time()) + "</p>")
 </body>
 </html>
 ```
+
+### 智能路由映射示例
+
+#### 1. 虚拟后缀映射 (Virtual Extension)
+如果你请求 `/rss.xml`，而 `WWW` 目录下存在 `rss.xml.pys`，服务器将自动执行该脚本并返回结果。
+
+#### 2. 通配符文件 (Wildcard matching)
+创建名为 `post.{}.pys` 的文件，它可以捕获多种动态路径：
+- 访问 `/post/123` -> 匹配 `post.{}.pys`
+- 访问 `/post-news.html` -> 匹配 `post.{}.pys`
+- 在脚本内调用 `path()` 将返回原始请求路径（如 `/post/123`）。
+
+#### 3. 灵活索引 (Flexible Index)
+支持 `index.任何后缀.pys` 作为目录入口。例如 `index.rss.pys` 会在访问目录根路径时被执行（如果不存在标准 `index.pys`）。
 
 ### 可用的 Python 函数
 

@@ -276,6 +276,13 @@ def remote_addr():
 
     return request.remote_addr
 
+def set_header(key, value):
+    if not hasattr(request, 'custom_headers'):
+        request.custom_headers = {}
+    request.custom_headers[key] = value
+
+def set_content_type(mimetype):
+    set_header('Content-Type', mimetype)
 
 # ======================
 # File Operations

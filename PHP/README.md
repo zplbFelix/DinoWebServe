@@ -1,2 +1,0 @@
-If you need PHP support, please download the required version in zip format from the "PHP.NET" official website and unzip it to this folder
-Alternatively, you can directly obtain the fixed version of PHP from the following link: https://windows.php.net/downloads/releases/php-8.4.8-nts-Win32-vs17-x64.zip

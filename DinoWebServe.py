@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # -*- coding:utf-8 -*-
 """
 DinoWebServe.py
@@ -7,17 +8,25 @@ License: GPL-3.0
 A lightweight web server implementation using Flask
 This program is free software under the GNU General Public License v3.0
 """
-import datetime
-import os
-import logging
-from flask import Flask, request, make_response, Response
-import colorama
-import sys
-import subprocess
-import html
-import ast
-import requests
+from flask import Flask, request, make_response, Response, send_file
 from urllib.parse import urlparse
+import subprocess
+import functools
+import threading
+import colorama
+import builtins
+import datetime
+import requests
+import tempfile
+import logging
+import sqlite3
+import shutil
+import queue
+import glob
+import html
+import sys
+import io
+import os
 
 # Initialize colorama for colored console output
 colorama.init()
@@ -37,13 +46,25 @@ class Config:
     LOG_DIR = './log'
     LOG_RETENTION_DAYS = None
     CONFIG_DIR = "./config"
-    
-    # Large file download settings
+
+    # Performance settings
+    THREADS = 32  # waitress worker threads
+    CONSOLE_LOG = True  # print request logs to console (done in a background thread)
+    STATIC_MAX_AGE = 3600  # Cache-Control max-age for static files (HTML always 0)
+
+    # How pys scripts get a per-thread working directory:
+    #   'auto'   - Linux: real per-thread cwd via unshare(CLONE_FS) if the system allows it,
+    #              otherwise (and on Windows/macOS) patch the common file APIs
+    #   'native' - like auto, but warn loudly if the native method is unavailable
+    #   'patch'  - always patch the file APIs
+    CWD_MODE = 'auto'
+
+    # Large file download settings (kept for compatibility; send_file handles streaming/Range)
     LARGE_FILE_THRESHOLD = 50 * 1024 * 1024  # 50MB threshold for streaming
     CHUNK_SIZE = 64 * 1024  # 64KB chunks for streaming
 
     # File type categories
-    HTML_EXTENSIONS = ['html', 'htm', 'pys', 'php', 'pp']
+    HTML_EXTENSIONS = ['html', 'htm', 'pys']
     IMAGE_EXTENSIONS = ['bmp', 'gif', 'jpg', 'png', 'jpeg', 'webp', 'svg', 'ico', 'tif', 'tiff']
     VIDEO_EXTENSIONS = ['mp4', 'webm', 'avi', 'mov', 'wmv', 'flv', 'mkv']
     AUDIO_EXTENSIONS = ['mp3', 'wav', 'ogg', 'aac', 'flac', 'm4a']
@@ -113,16 +134,13 @@ class Config:
         'csv': 'text/csv'
     }
 
-    #Python functions or libraries that are prohibited or allowed to run
+    # Python functions or libraries that are prohibited or allowed to run
     DISABLE_PYTHON_FUNCTIONS = []
     ENABLE_PYTHON_LIBRARIES = ['sys', 'os', 'math', 'datetime', 'time', 'random', 'json',
                                're', 'collections', 'subprocess', 'socket', 'urllib',
                                'csv', 'pickle', 'sqlite3', 'hashlib', 'itertools', 'logging',
                                'secret', 'base64', 'email', 'functools', 'glob', 'html',
                                'string', 'shutil', 'smtplib']
-
-    #PHP related content
-    PHP_CGI_PATH = "./PHP/php-cgi"
 
 
 # Try to load custom configuration
@@ -139,17 +157,28 @@ try:
 except Exception as e:
     print(colorama.Fore.RED + f'Error loading config: {str(e)}\nUsing default configuration')
 
+# function.py: compiled once at startup, exec'd per request into a fresh scope
 function_config = ""
+FUNCTION_CODE = None
 try:
     config_path = os.path.join(Config.CONFIG_DIR, 'function.py')
     if os.path.exists(config_path):
         with open(config_path, 'r', encoding='utf-8') as config_file:
             function_config = config_file.read()
+        FUNCTION_CODE = compile(function_config, config_path, 'exec')
         print(colorama.Fore.GREEN + 'Function loaded successfully')
     else:
         print(colorama.Fore.YELLOW + 'No Function file found, using defaults')
 except Exception as e:
     print(colorama.Fore.RED + f'Error loading Function: {str(e)}')
+
+# Libraries made available to pys scripts: imported once at startup
+_LIBS = {}
+for _lib_name in Config.ENABLE_PYTHON_LIBRARIES:
+    try:
+        _LIBS[_lib_name] = __import__(_lib_name)
+    except Exception:
+        continue
 
 # Initialize Flask app
 app = Flask(__name__, static_folder=None)
@@ -180,14 +209,263 @@ def get_ip():
 
     return request.remote_addr
 
+
+# ================
+# Per-thread working directory (patches)
+# ================
+# There is no per-thread cwd on Windows, so instead of os.chdir() (process-wide)
+# we patch the common file APIs: while a pys script runs, relative paths are
+# resolved against that script's directory, stored in a thread-local variable.
+# Threads that are not running pys code (_tls.cwd is None) see no difference.
+
+_tls = threading.local()
+_real_getcwd = os.getcwd
+_real_chdir = os.chdir
+_real_isabs = os.path.isabs
+_real_join = os.path.join
+_real_abspath = os.path.abspath
+
+# keyword names that carry a path
+_PATH_KEYS = ('file', 'path', 'top', 'name', 'src', 'dst', 'database')
+
+
+def _resolve(p):
+    d = getattr(_tls, 'cwd', None)
+    if d is None:
+        return p
+    if isinstance(p, os.PathLike):
+        p = os.fspath(p)
+    if isinstance(p, str) and not _real_isabs(p):
+        return _real_join(d, p)
+    return p
+
+
+def _wrap(fn, n=1, default=None):
+    """Wrap fn so that its first n positional args (and common path kwargs) are resolved."""
+
+    @functools.wraps(fn)
+    def w(*a, **k):
+        if getattr(_tls, 'cwd', None) is not None and k.get('dir_fd') is None:
+            a = list(a)
+            for i in range(min(n, len(a))):
+                a[i] = _resolve(a[i])
+            has_kw = False
+            for key in _PATH_KEYS:
+                if key in k:
+                    k[key] = _resolve(k[key])
+                    has_kw = True
+            if default is not None and not a and not has_kw:
+                a.append(_resolve(default))
+        return fn(*a, **k)
+
+    return w
+
+
+def install_cwd_patches():
+    # built-in open (pathlib's Path.open goes through io.open as well)
+    builtins.open = _wrap(builtins.open)
+    io.open = builtins.open
+
+    # os: single-path functions
+    for name in ('stat', 'lstat', 'remove', 'unlink', 'mkdir', 'makedirs',
+                 'rmdir', 'removedirs', 'chmod', 'utime', 'open'):
+        if hasattr(os, name):
+            setattr(os, name, _wrap(getattr(os, name)))
+    # os.walk() and glob call os.scandir/os.listdir internally, so patching these covers them
+    os.listdir = _wrap(os.listdir, default='.')
+    os.scandir = _wrap(os.scandir, default='.')
+
+    # os: two-path functions
+    for name in ('rename', 'replace'):
+        setattr(os, name, _wrap(getattr(os, name), n=2))
+
+    # os.path
+    for name in ('exists', 'lexists', 'isfile', 'isdir', 'islink', 'getsize',
+                 'getmtime', 'getctime', 'abspath', 'realpath'):
+        if hasattr(os.path, name):
+            setattr(os.path, name, _wrap(getattr(os.path, name)))
+
+    # getcwd / chdir operate on the thread-local directory while a pys script runs
+    def getcwd():
+        d = getattr(_tls, 'cwd', None)
+        return d if d is not None else _real_getcwd()
+
+    def chdir(p):
+        if getattr(_tls, 'cwd', None) is not None:
+            _tls.cwd = _real_abspath(_resolve(p))
+        else:
+            _real_chdir(p)
+
+    os.getcwd = getcwd
+    os.chdir = chdir
+
+    # shutil
+    for name in ('copy', 'copy2', 'copyfile', 'move', 'copytree'):
+        setattr(shutil, name, _wrap(getattr(shutil, name), n=2))
+    shutil.rmtree = _wrap(shutil.rmtree)
+
+    # glob
+    _real_glob = glob.glob
+
+    @functools.wraps(_real_glob)
+    def _glob(pattern, *a, **k):
+        d = getattr(_tls, 'cwd', None)
+        if d is not None and sys.version_info >= (3, 10) and 'root_dir' not in k \
+                and isinstance(pattern, str) and not _real_isabs(pattern):
+            k['root_dir'] = d
+        return _real_glob(pattern, *a, **k)
+
+    glob.glob = _glob
+
+    # sqlite3
+    _real_connect = sqlite3.connect
+
+    @functools.wraps(_real_connect)
+    def connect(database, *a, **k):
+        if isinstance(database, (str, os.PathLike)):
+            s = os.fspath(database)
+            if isinstance(s, str) and s != ':memory:' and not s.startswith('file:'):
+                database = _resolve(s)
+        return _real_connect(database, *a, **k)
+
+    sqlite3.connect = connect
+
+    # subprocess: default cwd (subprocess.run/call/check_output all go through Popen)
+    _Popen = subprocess.Popen
+
+    class Popen(_Popen):
+        def __init__(self, *a, **k):
+            d = getattr(_tls, 'cwd', None)
+            if k.get('cwd') is None and d is not None:
+                k['cwd'] = d
+            super().__init__(*a, **k)
+
+    subprocess.Popen = Popen
+
+
+# ---- Linux: a real per-thread cwd ----
+# On Linux a thread can stop sharing its cwd with the other threads of the process by calling
+# unshare(CLONE_FS). After that, os.chdir() in this thread only affects this thread, and *every*
+# file API (sqlite3, subprocess, ctypes libraries, ...) sees the right directory, so no API
+# patching is needed. Some containers/sandboxes block the syscall (seccomp), so we probe it at
+# startup and fall back to the patches above when it does not work.
+
+_CLONE_FS = 0x00000200
+_libc = None
+
+
+def _detect_native_thread_cwd():
+    """Return True if per-thread cwd via unshare(CLONE_FS) really works on this system."""
+    global _libc
+    if not sys.platform.startswith('linux'):
+        return False
+    try:
+        import ctypes
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.unshare.argtypes = [ctypes.c_int]
+        libc.unshare.restype = ctypes.c_int
+    except Exception:
+        return False
+
+    try:
+        orig = os.getcwd()
+    except OSError:
+        return False
+    probe_dir = tempfile.mkdtemp(prefix='dws-probe-')
+    result = {'ok': False}
+
+    def probe():
+        try:
+            if libc.unshare(_CLONE_FS) != 0:
+                return  # blocked (EPERM etc.); do NOT chdir, that would affect the whole process
+            os.chdir(probe_dir)
+            result['ok'] = True
+        except Exception:
+            pass
+
+    t = threading.Thread(target=probe, name='cwd-probe')
+    t.start()
+    t.join()
+
+    try:
+        isolated = os.getcwd() == orig  # the chdir in the probe thread must not leak
+    except OSError:
+        isolated = False
+    if not isolated:
+        try:
+            os.chdir(orig)
+        except OSError:
+            pass
+    try:
+        os.rmdir(probe_dir)
+    except OSError:
+        pass
+
+    if result['ok'] and isolated:
+        _libc = libc
+        return True
+    return False
+
+
+def _ensure_thread_fs():
+    """Give the current thread its own cwd (once per thread). Returns True on success."""
+    ok = getattr(_tls, 'fs_unshared', None)
+    if ok is None:
+        ok = _libc.unshare(_CLONE_FS) == 0
+        _tls.fs_unshared = ok
+        if ok:
+            _tls.base_cwd = os.getcwd()
+    return ok
+
+
+_cwd_mode = str(getattr(Config, 'CWD_MODE', 'auto')).lower()
+NATIVE_CWD = False
+if _cwd_mode in ('auto', 'native'):
+    NATIVE_CWD = _detect_native_thread_cwd()
+    if _cwd_mode == 'native' and not NATIVE_CWD:
+        print(colorama.Fore.YELLOW + 'CWD_MODE=native requested but unshare(CLONE_FS) is not available here, '
+                                     'falling back to patched file APIs' + colorama.Fore.RESET)
+
+if NATIVE_CWD:
+    print(colorama.Fore.GREEN + 'pys working directory: native per-thread cwd (unshare CLONE_FS)'
+          + colorama.Fore.RESET)
+else:
+    install_cwd_patches()
+    print(colorama.Fore.GREEN + 'pys working directory: patched file APIs' + colorama.Fore.RESET)
+
+
+def _enter_script_dir(script_dir):
+    """Make relative paths resolve against script_dir in the current thread."""
+    if not script_dir:
+        return
+    if NATIVE_CWD:
+        if _ensure_thread_fs():
+            os.chdir(script_dir)
+    else:
+        _tls.cwd = script_dir
+
+
+def _leave_script_dir():
+    """Undo _enter_script_dir (always called, even after errors)."""
+    if NATIVE_CWD:
+        if getattr(_tls, 'fs_unshared', False):
+            try:
+                os.chdir(_tls.base_cwd)
+            except OSError:
+                pass
+    else:
+        _tls.cwd = None
+
+
 # ================
 # Python Interpreter
 # ================
 
 def extract_python_tags(html_content):
     """
-    从HTML中提取内容，返回 [("html", ...), ("python", ...), ...] 格式的列表
+    Extract <python> tag from HTML, return the format: [("html", ...), ("python", ...), ...]
     """
+
     def _find_tag_end(html_content, start):
         i = start
         length = len(html_content)
@@ -205,6 +483,7 @@ def extract_python_tags(html_content):
                     i += 1
             i += 1
         return -1
+
     def _find_raw_text_end(html_content, i, end_tag):
         length = len(html_content)
         end_tag_len = len(end_tag)
@@ -226,6 +505,7 @@ def extract_python_tags(html_content):
                     string_char = c
             i += 1
         return -1
+
     results = []
     i = 0
     length = len(html_content)
@@ -237,13 +517,15 @@ def extract_python_tags(html_content):
     python_start = -1
     python_depth = 0
     html_start = 0
+
     def flush_html(end):
-        """将 [html_start, end) 范围内的 HTML 内容追加到结果"""
+        """Add [html_start, end) to the result"""
         nonlocal html_start
         chunk = html_content[html_start:end]
         if chunk:
             results.append(("html", chunk))
         html_start = end
+
     while i < length:
         if in_cdata:
             if html_content[i:i + 3] == ']]>':
@@ -284,7 +566,7 @@ def extract_python_tags(html_content):
         if not in_script and not in_python_tag and i + 7 <= length:
             tag_check = html_content[i:i + 7].lower()
             if tag_check == '<script' and (
-                i + 7 >= length or html_content[i + 7] in ' \t\n\r>/'):
+                    i + 7 >= length or html_content[i + 7] in ' \t\n\r>/'):
                 close = _find_tag_end(html_content, i + 7)
                 if close != -1:
                     in_script = True
@@ -295,7 +577,7 @@ def extract_python_tags(html_content):
         if not in_style and not in_python_tag and i + 6 <= length:
             tag_check = html_content[i:i + 6].lower()
             if tag_check == '<style' and (
-                i + 6 >= length or html_content[i + 6] in ' \t\n\r>/'):
+                    i + 6 >= length or html_content[i + 6] in ' \t\n\r>/'):
                 close = _find_tag_end(html_content, i + 6)
                 if close != -1:
                     in_style = True
@@ -327,14 +609,61 @@ def extract_python_tags(html_content):
                 continue
         i += 1
     if in_python_tag:
-        results.append(("python", f'echo("<span class="python-warning">Unclosed <python> tag detected (depth={python_depth}), content discarded.</span>")'))
+        results.append(("python",
+                        f"echo('<span class=\"python-warning\">Unclosed &lt;python&gt; tag detected (depth={python_depth}), content discarded.</span>')"))
     else:
         flush_html(length)
     return results
 
-def run_python(text, exec_scope=None):
+
+def _dedent_block(text):
+    """Remove the indentation of the first non-empty line from every line of the block"""
+    lines = text.split("\n")
+    first = next((l for l in lines if l.strip()), None)
+    if first is None:
+        return ""
+    g = first[:len(first) - len(first.lstrip(' \t'))]
+    if not g:
+        return text
+    return "\n".join(l[len(g):] if l.startswith(g) else l for l in lines)
+
+
+# Parsed + compiled pys files, keyed by path and invalidated by mtime
+_pys_cache = {}
+_pys_cache_lock = threading.Lock()
+
+
+def load_pys(path):
+    """Return [("html", str), ("python", code_object), ...] for a pys file (cached)."""
+    mtime = os.stat(path).st_mtime_ns
+    cached = _pys_cache.get(path)
+    if cached and cached[0] == mtime:
+        return cached[1]
+
+    with open(path, 'r', encoding=Config.ENCODING) as f:
+        parts = extract_python_tags(f.read())
+
+    compiled = []
+    for kind, content in parts:
+        if kind == "python":
+            try:
+                compiled.append(("python", compile(_dedent_block(content), path, 'exec')))
+            except SyntaxError as e:
+                err = html.escape(f'{e.msg} (line {e.lineno})')
+                compiled.append(("html", f'<span class="python-error">{err}</span>'))
+        else:
+            compiled.append(("html", content))
+
+    with _pys_cache_lock:
+        _pys_cache[path] = (mtime, compiled)
+    return compiled
+
+
+def run_python(code, exec_scope=None, script_dir=None):
+    """Execute one compiled <python> block. Relative file paths resolve against script_dir."""
+    content = ''
     try:
-        content = ''
+        _enter_script_dir(script_dir)
         if exec_scope is None:
             exec_scope = {
                 '__builtins__': __builtins__,
@@ -342,9 +671,11 @@ def run_python(text, exec_scope=None):
                 'app': app,
                 'Config': Config
             }
-            if function_config:
+            if script_dir:
+                exec_scope['PYS_DIR'] = script_dir
+            if FUNCTION_CODE is not None:
                 try:
-                    exec(function_config, exec_scope)
+                    exec(FUNCTION_CODE, exec_scope)
                 except Exception as e:
                     print(colorama.Fore.RED + f'Function execution failed: {str(e)}')
 
@@ -371,139 +702,41 @@ def run_python(text, exec_scope=None):
         for func in Config.DISABLE_PYTHON_FUNCTIONS:
             exec_scope[func] = ERROR
 
-        for i in Config.ENABLE_PYTHON_LIBRARIES:
-            if i not in exec_scope:
-                try:
-                    exec_scope[i] = __import__(i)
-                except:
-                    continue
+        for lib_name, lib in _LIBS.items():
+            exec_scope.setdefault(lib_name, lib)
 
-        g = "".join([n for n in [i for i in text.split("\n") if i.strip()][0] if n in ("\t", " ")])
-        text = "\n".join([t[len(g):] if t.startswith(g) else t for t in text.split("\n")])
-
-        exec(text, exec_scope)
+        exec(code, exec_scope)
     except Exception as e:
         error_msg = html.escape(str(e))
         content = f'<span class="python-error">{error_msg}</span>'
+    finally:
+        _leave_script_dir()  # always restore
     return content, exec_scope  # 同时返回 exec_scope 供下一个块使用
 
 
-def extract_all_python_tags(html):
-    """Extract the content of all <python> tags from HTML and execute"""
-    parse = extract_python_tags(html)
-    text = ""
+def serve_pys(path, WWW_ROOT):
+    """Run a pys file and build the response"""
+    try:
+        parts = load_pys(path)
+    except OSError:
+        return serve_error_page(404, WWW_ROOT)
+
+    script_dir = os.path.dirname(os.path.abspath(path))
+    text = []
     shared_scope = None
-    for s in parse:
-        if s[0] == "html":
-            text += s[1]
-        elif s[0] == "python":
-            result, shared_scope = run_python(s[1], shared_scope)
-            text += result
-    
-    response = make_response(text)
+    for kind, item in parts:
+        if kind == "html":
+            text.append(item)
+        else:
+            result, shared_scope = run_python(item, shared_scope, script_dir)
+            text.append(result)
+
+    response = make_response("".join(text))
     if hasattr(request, 'custom_headers'):
         for k, v in request.custom_headers.items():
             response.headers[k] = v
     return response
 
-# ================
-# PHP Interpreter
-# ================
-
-
-def run_php(filepath, WWW_ROOT):
-    filepath = filepath.replace('\\','/')
-    filename = filepath.split('/')[-1]
-    env = {
-        'GATEWAY_INTERFACE': 'CGI/1.1',
-        'SERVER_SOFTWARE': 'Flask/DinoWebServe',
-        'SERVER_NAME': request.host.split(':')[0],
-        'SERVER_PORT': str(request.host.split(':')[1] if ':' in request.host else '80'),
-        'SERVER_PROTOCOL': request.environ.get('SERVER_PROTOCOL', 'HTTP/1.1'),
-        'REQUEST_URI': request.full_path,
-        'REMOTE_ADDR': get_ip(),
-        'REMOTE_HOST': get_ip(),
-        'SCRIPT_NAME': request.path,
-        'SCRIPT_FILENAME': os.path.abspath(filepath),
-        'DOCUMENT_ROOT': os.path.abspath(WWW_ROOT),
-        'REQUEST_METHOD': request.method,
-        'QUERY_STRING': request.query_string.decode('utf-8'),
-        'CONTENT_TYPE': request.headers.get('Content-Type', ''),
-        'REDIRECT_STATUS': '0', 
-        'HTTP_USER_AGENT': request.headers.get('User-Agent', ''),
-        'HTTP_ACCEPT': request.headers.get('Accept', ''),
-        'HTTP_ACCEPT_LANGUAGE': request.headers.get('Accept-Language', ''),
-        'HTTP_ACCEPT_ENCODING': request.headers.get('Accept-Encoding', ''),
-        'HTTP_CONNECTION': request.headers.get('Connection', ''),
-        'HTTP_HOST': request.headers.get('Host', ''),
-        'PATH_INFO': filename,
-        **os.environ
-    }
-    stdin_data = None
-    if request.method in ['POST', 'PUT', 'PATCH']:
-        content_type = request.content_type
-        if 'application/x-www-form-urlencoded' in content_type:
-            stdin_data = request.get_data()
-        elif 'multipart/form-data' in content_type:
-            stdin_data = request.get_data()
-        elif 'application/json' in content_type:
-            stdin_data = request.get_data()
-        else:
-            stdin_data = request.get_data()
-        env['CONTENT_LENGTH'] = str(len(stdin_data)) if stdin_data else '0'
-    app.logger.debug(f"PHP Request: {env}")
-    app.logger.debug(f"POST Data: {stdin_data}")
-    try:
-        result = subprocess.run(
-            [Config.PHP_CGI_PATH],
-            env=env,
-            input=stdin_data if stdin_data else None,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=10
-        )
-
-        app.logger.debug(f"PHP Exit Code: {result.returncode}")
-        app.logger.debug(f"PHP Output: {result.stdout[:200]}")
-        app.logger.debug(f"PHP Error: {result.stderr[:200]}")
-
-        if result.returncode != 0:
-            error_msg = result.stderr.decode('utf-8', 'ignore') or "Unknown PHP error"
-            return f"PHP Execution Error (Code {result.returncode}): {error_msg}", 500
-
-        output = result.stdout
-
-        if b'\r\n\r\n' in output:
-            headers, body = output.split(b'\r\n\r\n', 1)
-        else:
-            headers = b''
-            body = output
-        response = Response(body)
-
-        if headers:
-            for line in headers.split(b'\r\n'):
-                if b':' in line:
-                    key, value = line.split(b':', 1)
-                    if key.strip().decode().lower() not in ['status', 'connection']:
-                        response.headers[key.strip().decode()] = value.strip().decode()
-
-        if 'Content-Type' not in response.headers:
-            response.headers['Content-Type'] = 'text/html; charset=utf-8'
-        
-        return response, body.decode()
-
-    except Exception as e:
-        app.logger.error(f"Server Error: {str(e)}")
-        return f"Server Error: {str(e)}", 500
-
-
-# ================
-# pp File
-# ================
-
-def run_pp(file_path, WWW_ROOT):
-    html = run_php(file_path, WWW_ROOT)[1]
-    return extract_all_python_tags(html)
 
 # ================
 # Helper Functions
@@ -521,65 +754,45 @@ def is_allowed_file(path, extensions):
 
 
 def serve_file(path, content_type, WWW_ROOT, as_attachment=False):
-    """Serve file with proper Content-Type header"""
+    """Serve a file with ETag / 304 / Range support (send_file streams from disk)"""
     try:
-        with open(path, 'rb') as f:
-            content = f.read()
-    except IOError:
-        return serve_error_page(404, WWW_ROOT)
-
-    response = make_response(content)
-    response.headers['Content-Type'] = content_type
-    if as_attachment:
-        filename = os.path.basename(path)
-        response.headers['Content-Disposition'] = f'attachment; filename="{filename}"'
-    return response
-
-
-def serve_large_file(path, content_type, WWW_ROOT, as_attachment=False):
-    """Serve large files using streaming to avoid memory issues"""
-    try:
-        # Get file size for Content-Length header
-        file_size = os.path.getsize(path)
-        
-        # Check if we should use streaming based on file size
-        if file_size < Config.LARGE_FILE_THRESHOLD:
-            # For smaller files, use the regular function
-            return serve_file(path, content_type, WWW_ROOT, as_attachment)
-        
-        # For large files, use streaming
-        def generate():
-            with open(path, 'rb') as f:
-                while True:
-                    chunk = f.read(Config.CHUNK_SIZE)
-                    if not chunk:
-                        break
-                    yield chunk
-        
-        response = Response(
-            generate(),
+        is_html = content_type.startswith('text/html')
+        return send_file(
+            os.path.abspath(path),
             mimetype=content_type,
-            direct_passthrough=True
+            as_attachment=as_attachment,
+            download_name=os.path.basename(path),
+            conditional=True,
+            max_age=0 if is_html else Config.STATIC_MAX_AGE
         )
-        
-        # Set headers
-        response.headers['Content-Length'] = file_size
-        response.headers['Accept-Ranges'] = 'bytes'
-        
-        if as_attachment:
-            filename = os.path.basename(path)
-            response.headers['Content-Disposition'] = f'attachment; filename="{filename}"'
-        
-        return response
-        
-    except IOError:
+    except OSError:
         return serve_error_page(404, WWW_ROOT)
+
+
+# send_file already streams large files, so one function is enough
+serve_large_file = serve_file
+
+
+def _unsafe_path(path):
+    """True for request paths that must never reach the file system (.. segments, NUL bytes)"""
+    if '\x00' in path:
+        return True
+    return any(seg == '..' for seg in path.replace('\\', '/').split('/'))
+
+
+def _is_within(root, target):
+    """True if target stays inside root (lexical check, symlinks inside the root are still allowed)"""
+    root = os.path.abspath(root)
+    target = os.path.abspath(target)
+    try:
+        return os.path.commonpath([root, target]) == root
+    except ValueError:  # e.g. different drives on Windows
+        return False
 
 
 def serve_error_page(status_code, WWW_ROOT):
     """Serve appropriate error page"""
-    error_page = (WWW_ROOT+os.path.join(Config.ERROR_DIR.replace('\\','/'), f'{status_code}.html')).replace('\\','/')
-    print(error_page)
+    error_page = os.path.join(WWW_ROOT, Config.ERROR_DIR.strip('/\\'), f'{status_code}.html')
     if os.path.exists(error_page):
         with open(error_page, 'r', encoding=Config.ENCODING) as f:
             return f.read(), status_code
@@ -633,6 +846,16 @@ def generate_directory_listing(path, url_path, WWW_ROOT):
 """
     return listing
 
+
+# ================
+# Logging (asynchronous)
+# ================
+# Request threads only put a dict on a queue; a background thread does the
+# console printing, file writing and old-log cleanup (at most once per day).
+
+_log_queue = queue.Queue()
+
+
 def cleanup_old_logs(days=3):
     """Delete log files older than `days` days"""
     now = datetime.datetime.now()
@@ -649,15 +872,43 @@ def cleanup_old_logs(days=3):
             except Exception as e:
                 print(f"Skipping {filename}: {e}")
 
+
+def _log_worker():
+    last_cleanup_date = None
+    try:
+        os.makedirs(Config.LOG_DIR, exist_ok=True)
+    except OSError:
+        pass
+    while True:
+        entry = _log_queue.get()
+        try:
+            log_str = str(entry)
+            if Config.CONSOLE_LOG:
+                print(f"\n{log_str}\n")
+
+            log_date = entry['timestamp'][:10]
+            os.makedirs(Config.LOG_DIR, exist_ok=True)
+            log_file = os.path.join(Config.LOG_DIR, f'{log_date}.log')
+            with open(log_file, 'a', encoding=Config.ENCODING) as f:
+                f.write(log_str + '\n')
+
+            # Clean the log only once a day.
+            if Config.LOG_RETENTION_DAYS and last_cleanup_date != log_date:
+                last_cleanup_date = log_date
+                cleanup_old_logs(days=Config.LOG_RETENTION_DAYS)
+        except Exception as e:
+            try:
+                print(colorama.Fore.RED + f'Log error: {e}' + colorama.Fore.RESET)
+            except Exception:
+                pass
+
+
+threading.Thread(target=_log_worker, name='log-worker', daemon=True).start()
+
+
 def log_request():
-    """Log request details to file and console"""
-    if not os.path.exists(Config.LOG_DIR):
-        os.makedirs(Config.LOG_DIR)
-
-    log_date = datetime.datetime.now().strftime('%Y-%m-%d')
-    log_file = os.path.join(Config.LOG_DIR, f'{log_date}.log')
-
-    log_entry = {
+    """Queue request details for the logging thread"""
+    _log_queue.put({
         'timestamp': datetime.datetime.now().isoformat(),
         'ip': get_ip(),
         'method': request.method,
@@ -665,17 +916,7 @@ def log_request():
         'url': request.url,
         'user_agent': request.headers.get('User-Agent'),
         'status': getattr(request, 'status_code', 200)
-    }
-
-    log_str = str(log_entry)
-    print(f"\n{log_str}\n")
-
-    with open(log_file, 'a', encoding=Config.ENCODING) as f:
-        f.write(log_str + '\n')
-
-    # 每次写日志时顺便清理旧日志
-    if Config.LOG_RETENTION_DAYS:
-        cleanup_old_logs(days=Config.LOG_RETENTION_DAYS)
+    })
 
 
 # ================
@@ -687,17 +928,17 @@ def forward_request(url, path, query_string):
     if query_string:
         url += f"?{query_string.decode()}"
     real_ip = get_ip()
-    # -------- 请求头处理 --------
+    # -------- Header processing --------
     headers = dict(request.headers)
-    # 强制修复 Host
+    # repair Host
     headers["Host"] = urlparse(url).netloc
-    # 防 gzip 差异（关键）
+    # prevent gzip differences
     headers.pop("Accept-Encoding", None)
-    # 覆盖所有客户端可伪造 IP 头
+    # covers all IP-related header
     headers["X-Real-IP"] = real_ip
     headers["X-Forwarded-For"] = real_ip
     headers["X-Forwarded-Proto"] = request.scheme
-    # -------- 请求转发 --------
+    # -------- forward request --------
     resp = _http_session.request(
         method=request.method,
         url=url,
@@ -708,13 +949,13 @@ def forward_request(url, path, query_string):
         allow_redirects=False
     )
 
-    # -------- 响应体（流式）--------
+    # -------- response --------
     def generate():
         for chunk in resp.iter_content(chunk_size=8192):
             if chunk:
                 yield chunk
 
-    # -------- 响应头处理 --------
+    # -------- Header processing --------
     excluded_headers = {
         'connection',
         'keep-alive',
@@ -739,6 +980,7 @@ def forward_request(url, path, query_string):
         headers=response_headers
     )
 
+
 @app.before_request
 def before_request():
     """Log all requests"""
@@ -749,7 +991,7 @@ def before_request():
 @app.route('/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE', 'HEAD', 'OPTIONS'])
 def serve(path):
     """Main request handler"""
-    if "../" in path:
+    if _unsafe_path(path):
         return "404", 404
     if isinstance(Config.WWW_ROOT, dict):
         if str(request.host) in Config.WWW_ROOT:
@@ -767,12 +1009,14 @@ def serve(path):
     else:
         WWW_ROOT = Config.WWW_ROOT
 
-    WWW_ROOT = WWW_ROOT.replace('/','\\')
+    WWW_ROOT = os.path.normpath(WWW_ROOT)
     fs_path = os.path.join(WWW_ROOT, path)
+    if not _is_within(WWW_ROOT, fs_path):  # e.g. an absolute path like /etc/passwd
+        return "404", 404
 
     # Try dynamic extension mapping (e.g., access rss.xml -> rss.xml.pys)
     if not os.path.exists(fs_path):
-        for dynamic_ext in ['pys', 'php', 'pp']:
+        for dynamic_ext in ['pys']:
             if os.path.isfile(fs_path + '.' + dynamic_ext):
                 fs_path = fs_path + '.' + dynamic_ext
                 break
@@ -780,18 +1024,18 @@ def serve(path):
     # Try wildcard mapping (e.g., access post/abc -> post.{}.pys)
     if not os.path.exists(fs_path):
         try:
-            # We look for a file that matches the prefix and has {} 
+            # We look for a file that matches the prefix and has {}
             parts = path.replace('\\', '/').split('/')
             for i in range(len(parts) + 1):
                 dir_rel = "/".join(parts[:i])
                 full_dir = os.path.join(WWW_ROOT, dir_rel)
                 if not os.path.isdir(full_dir):
                     break
-                
+
                 match_name = "/".join(parts[i:])
                 if not match_name:
                     continue
-                
+
                 for item in os.listdir(full_dir):
                     if '{}.' in item:
                         prefix, rest = item.split('{}.', 1)
@@ -839,13 +1083,7 @@ def serve(path):
 
         if found_index_path:
             if found_index_ext == 'pys':
-                with open(found_index_path, 'r', encoding=Config.ENCODING) as f:
-                    html_content = f.read()
-                return extract_all_python_tags(html_content)
-            if found_index_ext == 'php':
-                return run_php(found_index_path, WWW_ROOT)[1]
-            if found_index_ext == 'pp':
-                return run_pp(found_index_path, WWW_ROOT)
+                return serve_pys(found_index_path, WWW_ROOT)
             return serve_file(found_index_path, 'text/html', WWW_ROOT=WWW_ROOT)
         # Generate directory listing if no index file found
         return generate_directory_listing(fs_path, '/' + path, WWW_ROOT)
@@ -856,13 +1094,7 @@ def serve(path):
         # HTML files
         if ext in Config.HTML_EXTENSIONS:
             if ext == 'pys':
-                with open(fs_path, 'r', encoding=Config.ENCODING) as f:
-                    html_content = f.read()
-                return extract_all_python_tags(html_content)
-            if ext == 'php':
-                return run_php(fs_path, WWW_ROOT)[1]
-            if ext == 'pp':
-                return run_pp(fs_path, WWW_ROOT)
+                return serve_pys(fs_path, WWW_ROOT)
             return serve_file(fs_path, 'text/html', WWW_ROOT=WWW_ROOT)
 
         # Images
@@ -883,7 +1115,8 @@ def serve(path):
 
         # Downloadable files
         elif ext in Config.DOWNLOAD_EXTENSIONS:
-            return serve_large_file(fs_path, Config.MIME_TYPES.get(ext, 'application/octet-stream'), as_attachment=True, WWW_ROOT=WWW_ROOT)
+            return serve_large_file(fs_path, Config.MIME_TYPES.get(ext, 'application/octet-stream'), as_attachment=True,
+                                    WWW_ROOT=WWW_ROOT)
 
         # Other files
         else:
@@ -893,6 +1126,7 @@ def serve(path):
 
     # File not found
     return serve_error_page(404, WWW_ROOT)
+
 
 for code in [400, 401, 403, 404, 405, 406, 408, 409, 410,
              411, 412, 413, 414, 415, 416, 417, 418, 422,
@@ -917,7 +1151,23 @@ for code in [400, 401, 403, 404, 405, 406, 408, 409, 410,
 
 if __name__ == "__main__":
     print(f"Starting server on port {Config.PORT}")
-    app.run(host='0.0.0.0', port=Config.PORT)
+    try:
+        try:
+            from waitress import serve as waitress_serve
 
-
-
+            waitress_serve(app, host='0.0.0.0', port=Config.PORT,
+                           threads=Config.THREADS, ident='DinoWebServe')
+        except ImportError:
+            print(colorama.Fore.YELLOW + 'waitress not installed (pip install waitress), '
+                                         'falling back to the Flask development server'
+                  + colorama.Fore.RESET)
+            app.run(host='0.0.0.0', port=Config.PORT, threaded=True)
+    except PermissionError:
+        if os.name == 'posix' and Config.PORT < 1024:
+            print(colorama.Fore.RED + f'Permission denied for port {Config.PORT}: ports below 1024 need root on Linux.\n'
+                                      '  - use a port >= 1024 (and proxy with nginx / Cloudflare), or\n'
+                                      '  - run: sudo setcap cap_net_bind_service=+ep "$(readlink -f "$(which python3)")", or\n'
+                                      '  - run: sudo sysctl net.ipv4.ip_unprivileged_port_start=80'
+                  + colorama.Fore.RESET)
+            sys.exit(1)
+        raise

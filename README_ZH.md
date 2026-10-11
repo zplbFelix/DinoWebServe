@@ -5,17 +5,16 @@
 </div>
 </br>
 
+注意！本项目新版本以停止对php脚本的执行。
 
-一个基于 Flask 的轻量级多功能 Web 服务器，支持动态脚本执行、文件服务和自定义配置。
+一个基于 Flask 的轻量级多功能 Web 服务器，支持动态执行python代码、文件服务和自定义配置。
 
 ## ✨ 功能特性
 
 ### 🌐 核心功能
 - **静态文件服务**：支持多种文件类型的 HTTP 服务
 - **目录浏览**：可配置的目录列表功能
-- **动态脚本支持**：
-  - **Python 脚本 (.pys)**：内嵌 Python 代码执行
-  - **PHP 支持**：通过 PHP-CGI 执行 PHP 脚本
+- **Python 脚本 (.pys) 支持**：内嵌 Python 代码执行
 - **自定义错误页面**：支持自定义 HTTP 错误页面
 - **请求日志**：按日期记录所有 HTTP 请求
 - **日志自动清理**：可按保留天数自动删除过期日志
@@ -29,29 +28,28 @@
 - Python 3.8+
 - Flask
 - colorama
-- PHP-CGI（如需 PHP 支持）
+- waitress
 
 ## 🚀 快速开始
 
 ### 1. 安装依赖
 
 ```bash
-pip install flask colorama
+pip install flask colorama waitress
 ```
 
 ### 2. 项目结构
 
 ```
 DinoWebServe/
-├── DinoWebServe.py      # 主程序文件
+├── DinoWebServe.py     # 主程序文件
 ├── config/
-│   └── config.cfg      # 配置文件
+│   ├── config.cfg      # 配置文件
+│   └── function.py     # 内置函数
 ├── WWW/                # Web 根目录
 │   └── error/          # 错误页面目录
 │       ├── 404.html
 │       └── ...
-├── PHP/                # PHP 相关文件
-│   └── php-cgi.exe     # PHP-CGI 执行文件
 └── log/                # 日志目录
 ```
 
@@ -77,16 +75,13 @@ Config.DIR_LISTING = False        # 是否启用目录列表
 Config.LOG_DIR = './log'          # 日志文件目录
 Config.LOG_RETENTION_DAYS = None  # 日志保留天数（None 表示不自动删除）
 Config.CONFIG_DIR = "./config"    # 配置文件目录
-
-# PHP 配置
-Config.PHP_CGI_PATH = "./PHP/php-cgi"  # PHP-CGI 路径
 ```
 
 此外，你可以在 `config.cfg` 中配置文件类型分类、MIME 类型映射，以及 Python 执行白名单：
 
 ```python
 # 文件类型分类（可扩展）
-Config.HTML_EXTENSIONS = ['html', 'htm', 'pys', 'php', 'pp']
+Config.HTML_EXTENSIONS = ['html', 'htm', 'pys']
 
 # MIME 类型映射（常见类型已内置，可按需扩展）
 Config.MIME_TYPES.update({
@@ -94,8 +89,8 @@ Config.MIME_TYPES.update({
 })
 
 # Python 执行限制
-DISABLE_PYTHON_FUNCTIONS = []  # 禁用的函数
-ENABLE_PYTHON_LIBRARIES = ['sys', 'os', 'math', 'datetime', 'time', 'json', ...]  # 允许导入的库
+Config.DISABLE_PYTHON_FUNCTIONS = []  # 禁用的函数
+Config.ENABLE_PYTHON_LIBRARIES = ['sys', 'os', 'math', 'datetime', 'time', 'json', ...]  # 允许导入的库
 ```
 
 ### 多主机映射与反向代理（新增）
@@ -136,26 +131,6 @@ Config.WWW_ROOT = {
     <python>
 echo("<p>当前时间：" + str(datetime.datetime.now()) + "</p>")
 echo("<p>您的 IP 地址：" + remote_addr() + "</p>")
-    </python>
-</body>
-</html>
-```
-
-#### PHP+Python 混合文件 (.pp)
-
-创建 `WWW/index.pp` 文件，可以同时包含 PHP 和 Python 代码：
-
-```html
-<!DOCTYPE html>
-<html>
-<body>
-    <?php
-        echo "<h1>PHP 生成的内容</h1>";
-        echo "<p>服务器时间：".date('Y-m-d H:i:s')."</p>";
-    ?>
-    
-    <python>
-echo("<p>Python 说：当前时间戳是 " + str(time.time()) + "</p>")
     </python>
 </body>
 </html>

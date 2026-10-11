@@ -5,6 +5,7 @@
 </div>
 </br>
 
+Note! New versions of this project no longer support the execution of PHP scripts.
 
 A lightweight multi-functional web server based on Flask, supporting dynamic script execution, file serving, and custom configuration.
 
@@ -13,9 +14,7 @@ A lightweight multi-functional web server based on Flask, supporting dynamic scr
 ### 🌐 Core Functions
 - **Static File Serving**: HTTP service supporting various file types
 - **Directory Browsing**: Configurable directory listing functionality
-- **Dynamic Script Support**:
-  - **Python Scripts (.pys)**: Embedded Python code execution
-  - **PHP Support**: Execute PHP scripts through PHP-CGI
+- **Python Scripts (.pys) Support**: Embedded Python code execution
 - **Custom Error Pages**: Support for custom HTTP error pages
 - **Request Logging**: Log all HTTP requests by date
 - **Automatic Log Cleanup**: Delete old logs based on retention days
@@ -29,14 +28,14 @@ A lightweight multi-functional web server based on Flask, supporting dynamic scr
 - Python 3.8+
 - Flask
 - colorama
-- PHP-CGI (for PHP support)
+- waitress
 
 ## 🚀 Quick Start
 
 ### 1. Install Dependencies
 
 ```bash
-pip install flask colorama
+pip install flask colorama waitress
 ```
 
 ### 2. Project Structure
@@ -45,13 +44,12 @@ pip install flask colorama
 DinoWebServe/
 ├── DinoWebServe.py      # Main program file
 ├── config/
-│   └── config.cfg      # Configuration file
+│   ├── config.cfg      # Configuration file
+│   └── function.py     # Built-in functions
 ├── WWW/                # Web root directory
 │   └── error/          # Error pages directory
 │       ├── 404.html
 │       └── ...
-├── PHP/                # PHP related files
-│   └── php-cgi.exe     # PHP-CGI executable
 └── log/                # Log directory
 ```
 
@@ -77,16 +75,13 @@ Config.DIR_LISTING = False        # Enable directory listing
 Config.LOG_DIR = './log'          # Log files directory
 Config.LOG_RETENTION_DAYS = None  # Log retention (None disables auto-deletion)
 Config.CONFIG_DIR = "./config"    # Configuration directory
-
-# PHP Configuration
-Config.PHP_CGI_PATH = "./PHP/php-cgi"  # PHP-CGI path
 ```
 
 You can also configure file type categories, MIME type mapping, and Python execution whitelist in `config.cfg`:
 
 ```python
 # File type categories (extensible)
-Config.HTML_EXTENSIONS = ['html', 'htm', 'pys', 'php', 'pp']
+Config.HTML_EXTENSIONS = ['html', 'htm', 'pys']
 
 # MIME type mapping (common types are built-in; extend as needed)
 Config.MIME_TYPES.update({
@@ -94,8 +89,8 @@ Config.MIME_TYPES.update({
 })
 
 # Python execution restrictions
-DISABLE_PYTHON_FUNCTIONS = []  # Disabled functions
-ENABLE_PYTHON_LIBRARIES = ['sys', 'os', 'math', 'datetime', 'time', 'json', ...]  # Allowed libraries
+Config.DISABLE_PYTHON_FUNCTIONS = []  # Disabled functions
+Config.ENABLE_PYTHON_LIBRARIES = ['sys', 'os', 'math', 'datetime', 'time', 'json', ...]  # Allowed libraries
 ```
 
 ### Host Mapping & Reverse Proxy (New)
@@ -136,26 +131,6 @@ Create `WWW/index.pys` file:
     <python>
 echo("<p>Current time: " + str(datetime.datetime.now()) + "</p>")
 echo("<p>Your IP address: " + remote_addr() + "</p>")
-    </python>
-</body>
-</html>
-```
-
-#### PHP+Python Hybrid Files (.pp)
-
-Create `WWW/index.pp` file that can contain both PHP and Python code:
-
-```html
-<!DOCTYPE html>
-<html>
-<body>
-    <?php
-        echo "<h1>PHP Generated Content</h1>";
-        echo "<p>Server time: ".date('Y-m-d H:i:s')."</p>";
-    ?>
-    
-    <python>
-echo("<p>Python says: Current timestamp is " + str(time.time()) + "</p>")
     </python>
 </body>
 </html>
